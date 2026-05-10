@@ -1,0 +1,7 @@
+fairness_aware_threshold=0.325176
+naive_threshold=0.448291
+max_disparity_constraint=0.1000
+fair_f1=0.404572
+fair_tpr_disparity=0.086893
+naive_f1=0.421274
+naive_tpr_disparity=0.564335
