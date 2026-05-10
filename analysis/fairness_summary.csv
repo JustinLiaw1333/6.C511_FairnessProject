@@ -1,0 +1,4 @@
+model,tpr_g0,tpr_g1,tpr_range,fpr_g0,fpr_g1,fpr_range
+Unconstrained,0.4773,0.6,0.1,0.0499,0.1154,0.1
+Constrained,0.4773,0.4667,0.0,0.049,0.0846,0.0
+CDC Baseline,0.3047,0.6733,0.4,0.2173,0.5704,0.4

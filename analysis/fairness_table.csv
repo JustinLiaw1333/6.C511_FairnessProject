@@ -1,0 +1,7 @@
+model,group_label,n,positives,negatives,tp,fn,fp,tn,tpr,fpr
+Unconstrained,Non-Persistent Poverty Counties,1167,44,1123,21,23,56,1067,0.4773,0.0499
+Unconstrained,Persistent Poverty Counties,145,15,130,9,6,15,115,0.6,0.1154
+Constrained,Non-Persistent Poverty Counties,1167,44,1123,21,23,55,1068,0.4773,0.049
+Constrained,Persistent Poverty Counties,145,15,130,7,8,11,119,0.4667,0.0846
+CDC Baseline,Non-Persistent Poverty Counties,2716,512,2204,156,356,479,1725,0.3047,0.2173
+CDC Baseline,Persistent Poverty Counties,392,101,291,68,33,166,125,0.6733,0.5704
