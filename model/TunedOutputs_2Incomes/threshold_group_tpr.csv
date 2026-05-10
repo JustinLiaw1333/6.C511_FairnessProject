@@ -1,0 +1,3 @@
+income_group,label,tpr_at_fair_threshold
+0,non_persistent,0.6363636363636364
+1,persistent_poverty,0.6666666666666666

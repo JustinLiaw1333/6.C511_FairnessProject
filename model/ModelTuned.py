@@ -108,30 +108,29 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ── Data Loading ──────────────────────────────────────────────────────────────
 
 def load_data(path: str = "../data/heat_risk_dataframe.csv") -> pd.DataFrame:
-    """
-    Load the full county-level dataframe. All counties are included in training —
-    suppressed counties have MICE-imputed labels from the data notebook.
-    The suppression_flag is kept as metadata for sensitivity analysis only.
-    """
+    """Load county-level dataframe. Suppressed counties are excluded from training."""
     df = pd.read_csv(path, dtype={FIPS_COL: str})
+ 
+    before = len(df)
+    df = df.dropna(subset=[LABEL_COL])
+    if before != len(df):
+        print(f"  Dropped {before - len(df)} counties with missing labels")
+ 
     print(f"Loaded {len(df)} total counties from {path}")
-    print(f"  Observed counties   : {(df[SUPPRESSION_COL] == 0).sum()}")
-    print(f"  MICE-imputed counties: {(df[SUPPRESSION_COL] == 1).sum()}")
-    print(f"  High-risk (all)     : {df[LABEL_COL].sum()} ({df[LABEL_COL].mean():.1%})")
-    print(f"  High-risk (observed): "
+    print(f"  Observed counties    : {(df[SUPPRESSION_COL] == 0).sum()}")
+    print(f"  Suppressed counties  : {(df[SUPPRESSION_COL] == 1).sum()}")
+    print(f"  High-risk (observed) : "
           f"{df[df[SUPPRESSION_COL]==0][LABEL_COL].sum()} "
           f"({df[df[SUPPRESSION_COL]==0][LABEL_COL].mean():.1%})")
-    print(f"  High-risk (MICE)    : "
-          f"{df[df[SUPPRESSION_COL]==1][LABEL_COL].sum()} "
-          f"({df[df[SUPPRESSION_COL]==1][LABEL_COL].mean():.1%})")
-
+ 
     before = len(df)
     df = df.dropna(subset=HHI_INDICATORS)
-    after = len(df)
-    if before != after:
-        print(f"  Dropped {before - after} rows with missing HHI indicator values")
-
+    if before != len(df):
+        print(f"  Dropped {before - len(df)} rows with missing HHI indicators")
+ 
+    df[LABEL_COL] = df[LABEL_COL].astype(int)
     return df
+
 
 
 def validate_schema(df: pd.DataFrame) -> None:
@@ -142,6 +141,17 @@ def validate_schema(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(f"Missing columns: {missing}")
     print("Schema validation passed.")
+
+def split_observed_suppressed(df: pd.DataFrame):
+    """Split into observed (training) and suppressed (prediction-only) sets."""
+    train_df   = df[df[SUPPRESSION_COL] == 0].copy().reset_index(drop=True)
+    predict_df = df[df[SUPPRESSION_COL] == 1].copy().reset_index(drop=True)
+    print(f"\nTraining set (observed)    : {len(train_df)} counties")
+    print(f"Prediction set (suppressed): {len(predict_df)} counties")
+    print(f"  High-risk in training    : "
+          f"{train_df[LABEL_COL].sum()} ({train_df[LABEL_COL].mean():.1%})")
+    return train_df, predict_df
+
 
 
 def extract_arrays(df: pd.DataFrame):
@@ -232,147 +242,150 @@ def compute_tpr_disparity(y_true: np.ndarray,
 
 
 def fold_summary(preds_df: pd.DataFrame):
-    """
-    Average AUC, F1, and TPR disparity across folds.
-    Also returns separate AUC for observed vs MICE-imputed counties
-    as a sensitivity check.
-    """
-    aucs, f1s, disps       = [], [], []
-    aucs_obs, aucs_mice    = [], []
-
+    """Average AUC, F1, and TPR disparity across folds."""
+    aucs, f1s, disps = [], [], []
+ 
     for fold in preds_df["fold"].unique():
         fd  = preds_df[preds_df["fold"] == fold]
         y_t = fd["true_label"].values.astype(int)
         p   = fd["prob_high_risk"].values
         b   = fd["pred_high_risk"].values.astype(int)
         A_f = fd[SENSITIVE_COL].values
-
+ 
         if len(np.unique(y_t)) < 2:
             continue
-
+ 
         aucs.append(roc_auc_score(y_t, p))
         f1s.append(f1_score(y_t, b))
         disps.append(compute_tpr_disparity(y_t, b, A_f))
+        
+    return (np.mean(aucs), np.std(aucs),
+        np.mean(f1s),  np.std(f1s),
+        np.mean(disps))
 
-        # Sensitivity: AUC on observed counties only within this test fold
-        obs_mask  = fd[SUPPRESSION_COL].values == 0
-        mice_mask = fd[SUPPRESSION_COL].values == 1
-        if obs_mask.sum() > 0 and len(np.unique(y_t[obs_mask])) == 2:
-            aucs_obs.append(roc_auc_score(y_t[obs_mask], p[obs_mask]))
-        if mice_mask.sum() > 0 and len(np.unique(y_t[mice_mask])) == 2:
-            aucs_mice.append(roc_auc_score(y_t[mice_mask], p[mice_mask]))
-
-    return (np.mean(aucs),      np.std(aucs),
-            np.mean(f1s),       np.std(f1s),
-            np.mean(disps),
-            np.mean(aucs_obs)  if aucs_obs  else np.nan,
-            np.mean(aucs_mice) if aucs_mice else np.nan)
 
 
 # ── Parameterized Training Functions ─────────────────────────────────────────
 
 def train_unconstrained(
     X, y, meta, splits,
-    class_weight=None,
+    X_suppressed=None, meta_suppressed=None,
+    class_weight="balanced",
     c_grid=None,
     tag="",
 ):
     """
-    Unconstrained logistic regression trained on all counties (observed + MICE).
-    class_weight=None uses sklearn default (uniform) — appropriate now that
-    the natural class balance is ~25/75 rather than 5.6/94.4.
-    tag: suffix for output filenames during sweep (empty = final run).
+    Unconstrained logistic regression on observed counties only.
+    class_weight='balanced' compensates for 4.5% positive rate.
+    Suppressed counties predicted by each fold's model for external validation.
     """
     all_predictions  = []
     all_coefficients = []
-
+    all_suppressed   = []
+ 
     for fold, (train_idx, test_idx) in enumerate(splits):
         if not tag:
             print(f"\n── Unconstrained | Fold {fold + 1}/{N_FOLDS} ──")
-
+ 
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
-
+ 
         scaler  = StandardScaler()
         X_train = scaler.fit_transform(X_train)
         X_test  = scaler.transform(X_test)
-
+ 
         best_C = tune_regularization(X_train, y_train,
                                      c_grid=c_grid,
                                      class_weight=class_weight)
         if not tag:
             print(f"  Best C: {best_C}")
-
+ 
         model = LogisticRegression(
             penalty="l2", C=best_C, solver="lbfgs",
             max_iter=1000, random_state=RANDOM_STATE,
             class_weight=class_weight
         )
         model.fit(X_train, y_train)
-
+ 
         proba  = model.predict_proba(X_test)[:, 1]
         binary = model.predict(X_test)
-
+ 
         auc = roc_auc_score(y_test, proba)
         f1  = f1_score(y_test, binary)
         if not tag:
             print(f"  AUC-ROC: {auc:.4f} | F1: {f1:.4f}")
-
+ 
         fold_meta = meta.iloc[test_idx].copy()
         fold_meta["fold"]           = fold
         fold_meta["prob_high_risk"] = proba
         fold_meta["pred_high_risk"] = binary
         fold_meta["true_label"]     = y_test
         all_predictions.append(fold_meta)
-
+ 
         coef_row = {name: coef for name, coef in zip(HHI_INDICATORS, model.coef_[0])}
         coef_row["fold"]      = fold
         coef_row["intercept"] = model.intercept_[0]
         coef_row["best_C"]    = best_C
         all_coefficients.append(coef_row)
-
+ 
+        if X_suppressed is not None and len(X_suppressed) > 0:
+            X_sup_scaled = scaler.transform(X_suppressed)
+            sup_meta     = meta_suppressed.copy()
+            sup_meta["fold"]           = fold
+            sup_meta["prob_high_risk"] = model.predict_proba(X_sup_scaled)[:, 1]
+            sup_meta["pred_high_risk"] = model.predict(X_sup_scaled)
+            sup_meta["true_label"]     = np.nan
+            all_suppressed.append(sup_meta)
+ 
     predictions_df  = pd.concat(all_predictions, ignore_index=True)
     coefficients_df = pd.DataFrame(all_coefficients)
-
+ 
     suffix = f"_{tag}" if tag else ""
     predictions_df.to_csv(
         os.path.join(OUTPUT_DIR, f"predictions_unconstrained{suffix}.csv"), index=False)
     coefficients_df.to_csv(
         os.path.join(OUTPUT_DIR, f"coefficients_unconstrained{suffix}.csv"), index=False)
-
+ 
+    if all_suppressed and not tag:
+        sup_df = pd.concat(all_suppressed, ignore_index=True)
+        sup_df.to_csv(
+            os.path.join(OUTPUT_DIR, "predictions_unconstrained_suppressed.csv"), index=False)
+        print(f"  Suppressed predictions: {len(meta_suppressed)} counties × {N_FOLDS} folds")
+ 
     if not tag:
         print("\nUnconstrained model outputs saved.")
     return predictions_df, coefficients_df
-
-
+ 
+ 
 def train_constrained(
     X, y, A, meta, splits,
+    X_suppressed=None, meta_suppressed=None,
     eps=0.05,
     constrained_C=1.0,
-    class_weight=None,
+    class_weight="balanced",
     tag="",
 ):
     """
-    Fairness-constrained logistic regression trained on all counties.
+    Fairness-constrained logistic regression on observed counties.
     Sensitive attribute: poverty_quartile (1-4).
-    EqualizedOdds constraint enforces TPR/FPR parity across quartile groups.
-    tag: suffix for output filenames during sweep (empty = final run).
+    EqualizedOdds enforces TPR/FPR parity across quartile groups.
     """
     all_predictions  = []
     all_coefficients = []
-
+    all_suppressed   = []
+ 
     for fold, (train_idx, test_idx) in enumerate(splits):
         if not tag:
             print(f"\n── Constrained | Fold {fold + 1}/{N_FOLDS} ──")
-
+ 
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
         A_train         = A[train_idx]
-
+ 
         scaler  = StandardScaler()
         X_train = scaler.fit_transform(X_train)
         X_test  = scaler.transform(X_test)
-
+ 
         constraint     = EqualizedOdds()
         base_estimator = LogisticRegression(
             penalty="l2", C=constrained_C, solver="lbfgs",
@@ -387,22 +400,22 @@ def train_constrained(
             nu=1e-6
         )
         mitigator.fit(X_train, y_train, sensitive_features=A_train)
-
+ 
         proba  = ensemble_predict_proba(mitigator, X_test)
         binary = (proba >= 0.5).astype(int)
-
+ 
         auc = roc_auc_score(y_test, proba)
         f1  = f1_score(y_test, binary)
         if not tag:
             print(f"  AUC-ROC: {auc:.4f} | F1: {f1:.4f}")
-
+ 
         fold_meta = meta.iloc[test_idx].copy()
         fold_meta["fold"]           = fold
         fold_meta["prob_high_risk"] = proba
         fold_meta["pred_high_risk"] = binary
         fold_meta["true_label"]     = y_test
         all_predictions.append(fold_meta)
-
+ 
         best_est = get_best_estimator(mitigator)
         if best_est is not None:
             coef_row = {name: coef for name, coef
@@ -414,54 +427,65 @@ def train_constrained(
             coef_row["fold"]      = fold
             coef_row["intercept"] = np.nan
         all_coefficients.append(coef_row)
-
+ 
+        if X_suppressed is not None and len(X_suppressed) > 0:
+            X_sup_scaled = scaler.transform(X_suppressed)
+            sup_proba    = ensemble_predict_proba(mitigator, X_sup_scaled)
+            sup_meta     = meta_suppressed.copy()
+            sup_meta["fold"]           = fold
+            sup_meta["prob_high_risk"] = sup_proba
+            sup_meta["pred_high_risk"] = (sup_proba >= 0.5).astype(int)
+            sup_meta["true_label"]     = np.nan
+            all_suppressed.append(sup_meta)
+ 
     predictions_df  = pd.concat(all_predictions, ignore_index=True)
     coefficients_df = pd.DataFrame(all_coefficients)
-
+ 
     suffix = f"_{tag}" if tag else ""
     predictions_df.to_csv(
         os.path.join(OUTPUT_DIR, f"predictions_constrained{suffix}.csv"), index=False)
     coefficients_df.to_csv(
         os.path.join(OUTPUT_DIR, f"coefficients_constrained{suffix}.csv"), index=False)
-
+ 
+    if all_suppressed and not tag:
+        sup_df = pd.concat(all_suppressed, ignore_index=True)
+        sup_df.to_csv(
+            os.path.join(OUTPUT_DIR, "predictions_constrained_suppressed.csv"), index=False)
+        print(f"  Suppressed predictions: {len(meta_suppressed)} counties × {N_FOLDS} folds")
+ 
     if not tag:
         print("\nConstrained model outputs saved.")
     return predictions_df, coefficients_df
 
 
+
 # ── CDC Baseline ──────────────────────────────────────────────────────────────
 
-def generate_cdc_baseline(df: pd.DataFrame):
+def generate_cdc_baseline(train_df: pd.DataFrame,
+                           predict_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Generate binary predictions from the CDC's OVERALL_RANK equal-weights score.
-    Threshold set at 75th percentile across all counties.
-    Evaluated against MICE-imputed labels for all counties,
-    and separately for observed-only counties as a sensitivity check.
+    CDC equal-weights baseline. Threshold from observed counties only.
+    Evaluated on observed counties only since those are ground-truth labels.
     """
-    threshold = df[HHI_RANKING_COL].quantile(CDC_THRESHOLD_PCT)
-    print(f"\nCDC baseline threshold (75th pct): {threshold:.4f}")
-
-    cdc_df = df[[FIPS_COL, SENSITIVE_COL, DATA_QUALITY_COL,
-                 SUPPRESSION_COL, LABEL_COL, HHI_RANKING_COL]].copy()
-    cdc_df["prob_high_risk"] = df[HHI_RANKING_COL].values
-    cdc_df["pred_high_risk"] = (df[HHI_RANKING_COL] >= threshold).astype(int).values
-    cdc_df["true_label"]     = df[LABEL_COL].values
-
-    # All counties
-    auc = roc_auc_score(cdc_df["true_label"], cdc_df["prob_high_risk"])
-    f1  = f1_score(cdc_df["true_label"], cdc_df["pred_high_risk"])
-    print(f"CDC baseline (all counties)      — AUC-ROC: {auc:.4f} | F1: {f1:.4f}")
-
-    # Observed counties only — sensitivity check
+    threshold = train_df[HHI_RANKING_COL].quantile(CDC_THRESHOLD_PCT)
+    print(f"\nCDC baseline threshold (75th pct of observed): {threshold:.4f}")
+ 
+    all_df = pd.concat([train_df, predict_df], ignore_index=True)
+    cdc_df = all_df[[FIPS_COL, SENSITIVE_COL, DATA_QUALITY_COL,
+                     SUPPRESSION_COL, LABEL_COL, HHI_RANKING_COL]].copy()
+    cdc_df["prob_high_risk"] = all_df[HHI_RANKING_COL].values
+    cdc_df["pred_high_risk"] = (all_df[HHI_RANKING_COL] >= threshold).astype(int).values
+    cdc_df["true_label"]     = all_df[LABEL_COL].values
+ 
     obs = cdc_df[cdc_df[SUPPRESSION_COL] == 0]
-    auc_obs = roc_auc_score(obs["true_label"], obs["prob_high_risk"])
-    f1_obs  = f1_score(obs["true_label"], obs["pred_high_risk"])
-    print(f"CDC baseline (observed only)     — AUC-ROC: {auc_obs:.4f} | F1: {f1_obs:.4f}")
-
+    auc = roc_auc_score(obs["true_label"], obs["prob_high_risk"])
+    f1  = f1_score(obs["true_label"], obs["pred_high_risk"])
+    print(f"CDC baseline (observed only) — AUC-ROC: {auc:.4f} | F1: {f1:.4f}")
+ 
     cdc_df.to_csv(os.path.join(OUTPUT_DIR, "predictions_cdc_baseline.csv"), index=False)
     return cdc_df
-
-
+ 
+ 
 def save_cdc_implied_weights():
     pd.DataFrame([{"indicator": k, "cdc_implied_weight": v}
                   for k, v in CDC_IMPLIED_WEIGHTS.items()]).to_csv(
@@ -469,98 +493,43 @@ def save_cdc_implied_weights():
     print("CDC implied weights saved.")
 
 
-# ── Sensitivity Analysis ───────────────────────────────────────────────────────
-
-def run_sensitivity_analysis(predictions_df: pd.DataFrame,
-                              label: str = "unconstrained") -> pd.DataFrame:
-    """
-    Compare model performance on observed counties vs MICE-imputed counties.
-    This answers: does the model perform differently on counties where the label
-    was observed vs estimated? If so, the MICE labels may be introducing noise.
-
-    Saves sensitivity_observed_vs_mice.csv.
-    """
-    results = []
-
-    for group_name, mask_val in [("observed", 0), ("mice_imputed", 1)]:
-        group_df = predictions_df[predictions_df[SUPPRESSION_COL] == mask_val]
-        if len(group_df) == 0:
-            continue
-
-        aucs, f1s, disps = [], [], []
-        for fold in group_df["fold"].unique():
-            fd  = group_df[group_df["fold"] == fold]
-            y_t = fd["true_label"].values.astype(int)
-            p   = fd["prob_high_risk"].values
-            b   = fd["pred_high_risk"].values.astype(int)
-            A_f = fd[SENSITIVE_COL].values
-            if len(np.unique(y_t)) < 2:
-                continue
-            aucs.append(roc_auc_score(y_t, p))
-            f1s.append(f1_score(y_t, b))
-            disps.append(compute_tpr_disparity(y_t, b, A_f))
-
-        results.append({
-            "model":        label,
-            "county_group": group_name,
-            "n_counties":   group_df[FIPS_COL].nunique(),
-            "mean_auc":     np.mean(aucs)  if aucs  else np.nan,
-            "mean_f1":      np.mean(f1s)   if f1s   else np.nan,
-            "mean_disparity": np.mean(disps) if disps else np.nan,
-        })
-
-    result_df = pd.DataFrame(results)
-    print(f"\n  Sensitivity (observed vs MICE) — {label}:")
-    for _, row in result_df.iterrows():
-        print(f"    {row['county_group']:15s}: "
-              f"AUC={row['mean_auc']:.4f} | F1={row['mean_f1']:.4f} | "
-              f"disp={row['mean_disparity']:.4f} | n={int(row['n_counties'])}")
-    return result_df
-
-
 # ── Hyperparameter Sweep ──────────────────────────────────────────────────────
 
-def run_hyperparameter_sweep(X, y, A, meta, splits):
+def run_hyperparameter_sweep(X, y, A, meta, splits,
+                              X_suppressed=None, meta_suppressed=None):
     """
-    Sweep three hyperparameter axes on the full MICE-inclusive dataset.
-
+    Sweep three hyperparameters on observed counties only.
     Experiment 1 — eps: fairness tolerance in ExponentiatedGradient
-    Experiment 2 — class_weight: now testing None (uniform) since natural
-                   balance is ~25/75, alongside light weighting options
+    Experiment 2 — class_weight: compensating for 4.5% positive rate
     Experiment 3 — C in constrained model base estimator
-
-    Returns best values found for each parameter.
     """
-
+ 
     # ── Experiment 1: eps sweep ───────────────────────────────────────────────
     print("\n" + "="*60)
     print("SWEEP 1: eps — fairness-accuracy tradeoff")
     print("="*60)
-
+ 
     eps_values  = [0.01, 0.05, 0.10, 0.20]
     eps_results = []
-
+ 
     for eps in eps_values:
         print(f"  eps={eps} ...", end=" ", flush=True)
         preds, _ = train_constrained(
             X, y, A, meta, splits,
+            X_suppressed, meta_suppressed,
             eps=eps, tag=f"sweep_eps_{eps}"
         )
-        auc, auc_std, f1, f1_std, disp, auc_obs, auc_mice = fold_summary(preds)
+        auc, auc_std, f1, f1_std, disp = fold_summary(preds)
         eps_results.append({
             "eps": eps, "mean_auc": auc, "std_auc": auc_std,
             "mean_f1": f1, "std_f1": f1_std,
             "mean_tpr_disparity": disp,
-            "mean_auc_observed": auc_obs,
-            "mean_auc_mice": auc_mice,
         })
-        print(f"AUC={auc:.4f} | F1={f1:.4f} | disp={disp:.4f} "
-              f"(obs={auc_obs:.4f}, mice={auc_mice:.4f})")
-
+        print(f"AUC={auc:.4f} | F1={f1:.4f} | disp={disp:.4f}")
+ 
     eps_df = pd.DataFrame(eps_results)
     eps_df.to_csv(os.path.join(OUTPUT_DIR, "sweep_eps.csv"), index=False)
-
-    # Best eps: highest F1 where disparity <= 0.10 target
+ 
     fair_mask = eps_df["mean_tpr_disparity"] <= 0.10
     if fair_mask.any():
         best_eps_row = eps_df[fair_mask].loc[eps_df[fair_mask]["mean_f1"].idxmax()]
@@ -568,80 +537,73 @@ def run_hyperparameter_sweep(X, y, A, meta, splits):
         best_eps_row = eps_df.iloc[eps_df["mean_tpr_disparity"].argmin()]
     best_eps = float(best_eps_row["eps"])
     print(f"  → sweep_eps.csv saved | recommended eps={best_eps}")
-
+ 
     # ── Experiment 2: class_weight sweep ─────────────────────────────────────
     print("\n" + "="*60)
-    print("SWEEP 2: class_weight")
-    print("  Note: natural balance is now ~25/75 due to MICE labels.")
-    print("  Testing uniform weight alongside light overweighting options.")
+    print("SWEEP 2: class_weight — compensating for 4.5% positive rate")
     print("="*60)
-
-    # With 25/75 balance, uniform weighting is a reasonable default.
-    # Natural ratio is ~781/2327 ≈ 1/3, so testing up to 3x is sufficient.
+ 
+    # Natural imbalance ratio: ~1253/59 ≈ 21x — testing up to 17x
     cw_options = [
-        ("None (uniform)", None),
-        ("balanced",       "balanced"),
-        ("{0:1,1:2}",      {0: 1, 1: 2}),
-        ("{0:1,1:3}",      {0: 1, 1: 3}),
+        ("balanced",    "balanced"),
+        ("{0:1,1:5}",   {0: 1, 1: 5}),
+        ("{0:1,1:10}",  {0: 1, 1: 10}),
+        ("{0:1,1:17}",  {0: 1, 1: 17}),
     ]
     cw_results = []
-
-    for label, cw in cw_options:
-        print(f"  class_weight={label} ...", end=" ", flush=True)
+ 
+    for lbl, cw in cw_options:
+        print(f"  class_weight={lbl} ...", end=" ", flush=True)
         preds, _ = train_unconstrained(
             X, y, meta, splits,
+            X_suppressed, meta_suppressed,
             class_weight=cw,
-            tag=f"sweep_cw_{label.replace(' ', '_').replace('(', '').replace(')', '').replace(':', '').replace(',', '_').replace('{', '').replace('}', '')}"
+            tag=f"sweep_cw_{lbl.replace(':', '').replace(',', '_').replace('{', '').replace('}', '')}"
         )
-        auc, auc_std, f1, f1_std, disp, auc_obs, auc_mice = fold_summary(preds)
+        auc, auc_std, f1, f1_std, disp = fold_summary(preds)
         cw_results.append({
-            "class_weight": label, "mean_auc": auc, "std_auc": auc_std,
+            "class_weight": lbl, "mean_auc": auc, "std_auc": auc_std,
             "mean_f1": f1, "std_f1": f1_std,
             "mean_tpr_disparity": disp,
-            "mean_auc_observed": auc_obs,
-            "mean_auc_mice": auc_mice,
         })
         print(f"AUC={auc:.4f} | F1={f1:.4f} | disp={disp:.4f}")
-
+ 
     cw_df = pd.DataFrame(cw_results)
     cw_df.to_csv(os.path.join(OUTPUT_DIR, "sweep_class_weight.csv"), index=False)
-
+ 
     best_cw_idx   = cw_df["mean_f1"].idxmax()
     best_cw       = cw_options[best_cw_idx][1]
     best_cw_label = cw_options[best_cw_idx][0]
     print(f"  → sweep_class_weight.csv saved | best class_weight={best_cw_label}")
-
+ 
     # ── Experiment 3: constrained C sweep ────────────────────────────────────
     print("\n" + "="*60)
     print("SWEEP 3: C in constrained model base estimator")
     print("="*60)
-
+ 
     c_values  = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
     c_results = []
-
+ 
     for c_val in c_values:
         print(f"  C={c_val} ...", end=" ", flush=True)
         preds, _ = train_constrained(
             X, y, A, meta, splits,
+            X_suppressed, meta_suppressed,
             constrained_C=c_val,
             eps=best_eps,
             tag=f"sweep_constC_{c_val}"
         )
-        auc, auc_std, f1, f1_std, disp, auc_obs, auc_mice = fold_summary(preds)
+        auc, auc_std, f1, f1_std, disp = fold_summary(preds)
         c_results.append({
             "constrained_C": c_val, "mean_auc": auc, "std_auc": auc_std,
             "mean_f1": f1, "std_f1": f1_std,
             "mean_tpr_disparity": disp,
-            "mean_auc_observed": auc_obs,
-            "mean_auc_mice": auc_mice,
         })
         print(f"AUC={auc:.4f} | F1={f1:.4f} | disp={disp:.4f}")
-
+ 
     c_df = pd.DataFrame(c_results)
     c_df.to_csv(os.path.join(OUTPUT_DIR, "sweep_constrained_C.csv"), index=False)
-
-    # Best C: highest F1 where disparity <= 0.15 (slightly relaxed since C and
-    # eps interact — fairness is primarily controlled by eps)
+ 
     fair_mask_c = c_df["mean_tpr_disparity"] <= 0.15
     if fair_mask_c.any():
         best_c_row = c_df[fair_mask_c].loc[c_df[fair_mask_c]["mean_f1"].idxmax()]
@@ -649,7 +611,7 @@ def run_hyperparameter_sweep(X, y, A, meta, splits):
         best_c_row = c_df.iloc[c_df["mean_f1"].idxmax()]
     best_constrained_C = float(best_c_row["constrained_C"])
     print(f"  → sweep_constrained_C.csv saved | best C={best_constrained_C}")
-
+ 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "="*60)
     print("SWEEP COMPLETE — BEST PARAMETERS FOUND")
@@ -657,12 +619,12 @@ def run_hyperparameter_sweep(X, y, A, meta, splits):
     print(f"  best_eps           = {best_eps}")
     print(f"  best_class_weight  = {best_cw_label}")
     print(f"  best_constrained_C = {best_constrained_C}")
-
+ 
     return best_eps, best_cw, best_cw_label, best_constrained_C
-
-
+ 
+ 
 # ── Threshold Tuning ──────────────────────────────────────────────────────────
-
+ 
 def tune_threshold(predictions_df: pd.DataFrame,
                    max_disparity: float = 0.10) -> float:
     """
@@ -674,10 +636,10 @@ def tune_threshold(predictions_df: pd.DataFrame,
     y_true = predictions_df["true_label"].values.astype(int)
     proba  = predictions_df["prob_high_risk"].values
     A      = predictions_df[SENSITIVE_COL].values
-
+ 
     thresholds  = np.linspace(0.01, 0.99, 200)
     f1_scores, disparities, precisions, recalls = [], [], [], []
-
+ 
     for t in thresholds:
         y_pred = (proba >= t).astype(int)
         tp = ((y_pred == 1) & (y_true == 1)).sum()
@@ -690,15 +652,15 @@ def tune_threshold(predictions_df: pd.DataFrame,
         disparities.append(compute_tpr_disparity(y_true, y_pred, A))
         precisions.append(prec)
         recalls.append(rec)
-
+ 
     f1_scores   = np.array(f1_scores)
     disparities = np.array(disparities)
     precisions  = np.array(precisions)
     recalls     = np.array(recalls)
-
+ 
     naive_idx       = np.argmax(f1_scores)
     naive_threshold = thresholds[naive_idx]
-
+ 
     fair_mask = disparities <= max_disparity
     if fair_mask.any():
         fair_idx       = np.argmax(np.where(fair_mask, f1_scores, -1))
@@ -708,12 +670,12 @@ def tune_threshold(predictions_df: pd.DataFrame,
         fair_threshold = thresholds[fair_idx]
         print(f"  WARNING: No threshold achieves disparity <= {max_disparity:.2f}. "
               f"Using minimum disparity threshold.")
-
+ 
     fair_f1    = f1_scores[fair_idx]
     fair_disp  = disparities[fair_idx]
     naive_f1   = f1_scores[naive_idx]
     naive_disp = disparities[naive_idx]
-
+ 
     y_pred_fair = (proba >= fair_threshold).astype(int)
     groups      = sorted(np.unique(A))
     group_tprs  = {}
@@ -722,7 +684,7 @@ def tune_threshold(predictions_df: pd.DataFrame,
         y_g  = y_true[mask]
         p_g  = y_pred_fair[mask]
         group_tprs[g] = p_g[y_g == 1].mean() if y_g.sum() > 0 else 0.0
-
+ 
     print(f"\n{'─'*50}")
     print("THRESHOLD TUNING RESULTS")
     print(f"{'─'*50}")
@@ -734,7 +696,7 @@ def tune_threshold(predictions_df: pd.DataFrame,
     for g, tpr in group_tprs.items():
         lbl = "lowest poverty" if g == 1 else "highest poverty" if g == 4 else f"Q{g}"
         print(f"    Q{g} ({lbl}): {tpr:.4f}")
-
+ 
     with open(os.path.join(OUTPUT_DIR, "optimal_threshold.txt"), "w") as f:
         f.write(f"fairness_aware_threshold={fair_threshold:.6f}\n")
         f.write(f"naive_threshold={naive_threshold:.6f}\n")
@@ -743,7 +705,7 @@ def tune_threshold(predictions_df: pd.DataFrame,
         f.write(f"fair_tpr_disparity={fair_disp:.6f}\n")
         f.write(f"naive_f1={naive_f1:.6f}\n")
         f.write(f"naive_tpr_disparity={naive_disp:.6f}\n")
-
+ 
     pd.DataFrame({
         "threshold": thresholds,
         "f1":        f1_scores,
@@ -751,89 +713,81 @@ def tune_threshold(predictions_df: pd.DataFrame,
         "precision": precisions,
         "recall":    recalls,
     }).to_csv(os.path.join(OUTPUT_DIR, "threshold_curve.csv"), index=False)
-
+ 
     pd.DataFrame([
         {"poverty_quartile": g, "tpr_at_fair_threshold": tpr}
         for g, tpr in group_tprs.items()
     ]).to_csv(os.path.join(OUTPUT_DIR, "threshold_group_tpr.csv"), index=False)
-
+ 
     print(f"  → optimal_threshold.txt + threshold_curve.csv + "
           f"threshold_group_tpr.csv saved")
     return float(fair_threshold)
 
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # 1. Load all counties — observed + MICE-imputed labels
+    # 1. Load and validate
     df = load_data("../data/heat_risk_dataframe.csv")
     validate_schema(df)
-
-    # 2. Extract arrays — full dataset, no exclusions
-    X, y, A, meta = extract_arrays(df)
+ 
+    # 2. Split observed (training) from suppressed (prediction-only)
+    train_df, predict_df = split_observed_suppressed(df)
+ 
+    # 3. Extract arrays from observed counties only
+    X, y, A, meta         = extract_arrays(train_df)
+    X_sup, _, _, meta_sup = extract_arrays(predict_df)
     print(f"\nFeature matrix shape : {X.shape}")
-    print(f"Class balance        : {y.mean():.1%} high-risk "
-          f"(~{y.mean():.0%} positive — natural balance from MICE)")
-
-    # 3. CV splits on full dataset
+    print(f"Class balance        : {y.mean():.1%} high-risk in training set")
+ 
+    # 4. CV splits on observed counties only
     splits = generate_cv_splits(y)
-
-    # 4. Hyperparameter sweep
+ 
+    # 5. Hyperparameter sweep
     print("\n" + "="*60)
     print("HYPERPARAMETER SWEEP")
     print("="*60)
     best_eps, best_cw, best_cw_label, best_constrained_C = run_hyperparameter_sweep(
-        X, y, A, meta, splits
+        X, y, A, meta, splits, X_sup, meta_sup
     )
-
-    # 5. Final unconstrained model with best class_weight
+ 
+    # 6. Final unconstrained model
     print("\n" + "="*60)
     print(f"FINAL UNCONSTRAINED MODEL (class_weight={best_cw_label})")
     print("="*60)
     preds_unc, _ = train_unconstrained(
-        X, y, meta, splits,
+        X, y, meta, splits, X_sup, meta_sup,
         class_weight=best_cw
     )
-
-    # 6. Sensitivity analysis: observed vs MICE-imputed performance
-    print("\n" + "="*60)
-    print("SENSITIVITY ANALYSIS: Observed vs MICE-Imputed Counties")
-    print("="*60)
-    sens_df = run_sensitivity_analysis(preds_unc, label="unconstrained")
-
-    # 7. Threshold tuning on final unconstrained predictions
+ 
+    # 7. Threshold tuning
     print("\n" + "="*60)
     print("THRESHOLD TUNING")
     print("="*60)
     optimal_threshold = tune_threshold(preds_unc, max_disparity=0.10)
-
-    # 8. Final constrained model with best eps and C
+ 
+    # 8. Final constrained model
     print("\n" + "="*60)
     print(f"FINAL CONSTRAINED MODEL (eps={best_eps}, C={best_constrained_C})")
     print("="*60)
-    preds_con, _ = train_constrained(
-        X, y, A, meta, splits,
+    train_constrained(
+        X, y, A, meta, splits, X_sup, meta_sup,
         eps=best_eps,
         constrained_C=best_constrained_C,
         class_weight=best_cw
     )
-
-    # Sensitivity for constrained model too
-    sens_con = run_sensitivity_analysis(preds_con, label="constrained")
-    sens_all = pd.concat([sens_df, sens_con], ignore_index=True)
-    sens_all.to_csv(
-        os.path.join(OUTPUT_DIR, "sensitivity_observed_vs_mice.csv"), index=False)
-
-    # 9. CDC baseline on full dataset
+ 
+    # 9. CDC baseline
     print("\n" + "="*60)
     print("CDC EQUAL-WEIGHTS BASELINE")
     print("="*60)
-    generate_cdc_baseline(df)
+    generate_cdc_baseline(train_df, predict_df)
     save_cdc_implied_weights()
-
+ 
     # 10. Summary
     print("\n" + "="*60)
-    print("ALL OUTPUTS SAVED TO: TunedOutputs/")
+    print("ALL OUTPUTS SAVED TO: TunedOutputs_Case1/")
     print("="*60)
     print(f"  Best eps              : {best_eps}")
     print(f"  Best class_weight     : {best_cw_label}")
@@ -845,16 +799,15 @@ def main():
     print("\n  Threshold tuning:")
     for f in ["optimal_threshold.txt", "threshold_curve.csv", "threshold_group_tpr.csv"]:
         print(f"    {f}")
-    print("\n  Sensitivity analysis:")
-    print(f"    sensitivity_observed_vs_mice.csv")
     print("\n  Final model outputs:")
-    for f in ["predictions_unconstrained.csv", "predictions_constrained.csv",
+    for f in ["predictions_unconstrained.csv", "predictions_unconstrained_suppressed.csv",
+              "predictions_constrained.csv", "predictions_constrained_suppressed.csv",
               "predictions_cdc_baseline.csv", "coefficients_unconstrained.csv",
               "coefficients_constrained.csv", "cdc_implied_weights.csv",
               "cv_split_indices.pkl"]:
         print(f"    {f}")
     print("\nLoad all CSVs into your analysis notebook for plotting.")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
